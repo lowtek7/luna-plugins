@@ -70,18 +70,22 @@ redux.intercept("playQueue/ADD_NOW", unloads, (payload) => {
 redux.intercept(["playQueue/MOVE_TO", "playQueue/MOVE_NEXT", "playQueue/MOVE_PREVIOUS"], unloads, (payload, action) => {
 	(async () => {
 		const { elements, currentIndex } = PlayState.playQueue;
+		let replaced = false;
 		switch (action) {
 			case "playQueue/MOVE_NEXT":
-				if (!(await playMaxItem(elements, currentIndex + 1))) PlayState.next();
+				replaced = await playMaxItem(elements, currentIndex + 1);
+				if (!replaced) PlayState.next();
 				break;
 			case "playQueue/MOVE_PREVIOUS":
-				if (!(await playMaxItem(elements, currentIndex - 1))) PlayState.previous();
+				replaced = await playMaxItem(elements, currentIndex - 1);
+				if (!replaced) PlayState.previous();
 				break;
 			case "playQueue/MOVE_TO":
-				if (!(await playMaxItem(elements, payload ?? currentIndex))) PlayState.moveTo(payload ?? currentIndex);
+				replaced = await playMaxItem(elements, payload ?? currentIndex);
+				if (!replaced) PlayState.moveTo(payload ?? currentIndex);
 				break;
 		}
-		PlayState.play();
+		if (replaced) PlayState.play();
 	})();
 	return true;
 });
