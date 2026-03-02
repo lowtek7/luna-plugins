@@ -14,22 +14,6 @@ const getMaxItem = async (mediaItem?: MediaItem) => {
 	return maxItem;
 };
 
-const playMaxItem = async (elements: redux.PlayQueueElement[], index: number) => {
-	const newElements = [...elements];
-	if (newElements[index]?.mediaItemId === undefined) return false;
-
-	const mediaItem = await MediaItem.fromId(newElements[index].mediaItemId);
-	const maxItem = await getMaxItem(mediaItem);
-	if (maxItem === undefined) return false;
-
-	newElements[index] = { ...newElements[index], mediaItemId: maxItem.id };
-	PlayState.updatePlayQueue({
-		elements: newElements,
-		currentIndex: index,
-	});
-	return true;
-};
-
 export { Settings } from "./Settings";
 
 // Prefetch max on preload
@@ -37,15 +21,15 @@ MediaItem.onPreload(unloads, (mediaItem) => mediaItem.max().catch(trace.err.with
 
 MediaItem.onPreMediaTransition(unloads, async (mediaItem) => {
 	const maxItem = await getMaxItem(mediaItem);
-	if (!PlayState.playing) return;
-
-	PlayState.pause();
-	try {
-		if (maxItem !== undefined) PlayState.playNext(maxItem.id);
-	} catch (err) {
-		trace.msg.err.withContext("addNext")(err);
+	if (maxItem !== undefined && PlayState.playing) {
+		PlayState.pause();
+		try {
+			PlayState.playNext(maxItem.id);
+		} catch (err) {
+			trace.msg.err.withContext("addNext")(err);
+		}
+		PlayState.play();
 	}
-	PlayState.play();
 
 	// Preload next item
 	const nextItem = await PlayState.nextMediaItem();
@@ -70,22 +54,53 @@ redux.intercept("playQueue/ADD_NOW", unloads, (payload) => {
 redux.intercept(["playQueue/MOVE_TO", "playQueue/MOVE_NEXT", "playQueue/MOVE_PREVIOUS"], unloads, (payload, action) => {
 	(async () => {
 		const { elements, currentIndex } = PlayState.playQueue;
-		let replaced = false;
+		let targetIndex: number;
 		switch (action) {
 			case "playQueue/MOVE_NEXT":
-				replaced = await playMaxItem(elements, currentIndex + 1);
-				if (!replaced) PlayState.next();
+				targetIndex = currentIndex + 1;
 				break;
 			case "playQueue/MOVE_PREVIOUS":
-				replaced = await playMaxItem(elements, currentIndex - 1);
-				if (!replaced) PlayState.previous();
+				targetIndex = currentIndex - 1;
 				break;
 			case "playQueue/MOVE_TO":
-				replaced = await playMaxItem(elements, payload ?? currentIndex);
-				if (!replaced) PlayState.moveTo(payload ?? currentIndex);
+				targetIndex = payload ?? currentIndex;
+				break;
+			default:
+				return;
+		}
+
+		// Pre-swap the target track with its max version before transitioning
+		const element = elements[targetIndex];
+		if (element?.mediaItemId !== undefined) {
+			try {
+				const mediaItem = await MediaItem.fromId(element.mediaItemId);
+				const maxItem = await getMaxItem(mediaItem);
+				if (maxItem !== undefined) {
+					const newElements = [...elements];
+					newElements[targetIndex] = { ...newElements[targetIndex], mediaItemId: maxItem.id };
+					// Update queue but keep currentIndex unchanged — only swap the future track
+					PlayState.updatePlayQueue({
+						elements: newElements,
+						currentIndex,
+					});
+				}
+			} catch (err) {
+				trace.err.withContext(action)(err);
+			}
+		}
+
+		// Transition using normal PlayState methods (works with Tidal Connect)
+		switch (action) {
+			case "playQueue/MOVE_NEXT":
+				PlayState.next();
+				break;
+			case "playQueue/MOVE_PREVIOUS":
+				PlayState.previous();
+				break;
+			case "playQueue/MOVE_TO":
+				PlayState.moveTo(payload ?? currentIndex);
 				break;
 		}
-		if (replaced) PlayState.play();
 	})();
 	return true;
 });
