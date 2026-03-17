@@ -5,6 +5,7 @@ import { getDownloadFolder } from "./helpers";
 import { settings } from "./Settings";
 import { DownloadQueue } from "./DownloadQueue";
 import { mountPanel } from "./DownloadPanel";
+import { initCoverButtons } from "./CoverDownloadButton";
 
 import buttonStyles from "file://downloadButton.css?minify";
 import panelStyles from "file://downloadPanel.css?minify";
@@ -21,6 +22,9 @@ unloads.add(() => queue.destroy());
 
 // 다운로드 패널 마운트
 mountPanel(queue, unloads);
+
+// 커버 위 다운로드 버튼 주입
+initCoverButtons(queue, unloads);
 
 // 컨텍스트 메뉴 버튼
 const downloadButton = ContextMenu.addButton(unloads);
