@@ -15,9 +15,17 @@ export const getDownloadPath = async (defaultPath: string) => {
 	});
 	if (!canceled) return filePath;
 };
-export const getFileName = async (mediaItem: MediaItem, audioQuality?: redux.AudioQuality) => {
+
+/**
+ * FLAC 태그 객체를 받아서 설정된 pathFormat에 따라 파일명을 생성한다.
+ * DEFECT 3 수정: flacTags()를 호출자에서 한 번만 호출하고 결과를 전달받는다.
+ */
+export const getFileName = async (
+	mediaItem: MediaItem,
+	audioQuality: redux.AudioQuality | undefined,
+	tags: Record<string, string | string[] | undefined>,
+) => {
 	let fileName = `${settings.pathFormat}.${await mediaItem.fileExtension(audioQuality)}`;
-	const { tags } = await mediaItem.flacTags();
 	for (const tag of MediaItem.availableTags) {
 		let tagValue = tags[tag];
 		if (Array.isArray(tagValue)) tagValue = tagValue[0];
