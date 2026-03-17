@@ -34,6 +34,7 @@ const MaxRetryAttempts = 3;
 const RetryDelaysMs = [2000, 5000, 10000] as const;
 const MinValidFileSizeBytes = 1024;
 const ProgressPollMs = 300;
+const PrepBatchSize = 5;
 
 // --- 유틸리티 ---
 
@@ -109,63 +110,82 @@ export class DownloadQueue {
 		this.notify();
 	}
 
-	/** mediaCollection의 모든 트랙을 큐에 추가한다. */
+	/** mediaCollection의 모든 트랙을 큐에 추가한다. 배치 병렬로 메타 수집. */
 	async addTracks(mediaCollection: { mediaItems: () => Promise<AsyncIterable<MediaItem>>; count: () => Promise<number> }, downloadFolder: string): Promise<number> {
 		let added = 0;
 		let skipped = 0;
 
-		for await (let mediaItem of await mediaCollection.mediaItems()) {
+		// 1단계: mediaItems를 먼저 수집한다 (이터레이터 → 배열)
+		const rawItems: MediaItem[] = [];
+		for await (const mediaItem of await mediaCollection.mediaItems()) {
 			if (this._destroyed) break;
+			rawItems.push(mediaItem);
+		}
 
-			// 개별 트랙 메타 수집 실패를 격리: 한 곡이 실패해도 나머지는 계속 추가한다
-			try {
-				if (settings.useRealMAX) {
-					mediaItem = (await mediaItem.max?.()) ?? mediaItem;
-				}
+		// 2단계: 배치 병렬로 메타데이터 수집 + 큐 추가
+		for (let batchStart = 0; batchStart < rawItems.length; batchStart += PrepBatchSize) {
+			if (this._destroyed) break;
+			const batch = rawItems.slice(batchStart, batchStart + PrepBatchSize);
 
-				const { tags } = await mediaItem.flacTags();
-				const fileName = await getFileName(mediaItem, settings.downloadQuality, tags);
-				const path = [downloadFolder, fileName];
+			const results = await Promise.allSettled(
+				batch.map(async (rawItem) => {
+					let mediaItem = rawItem;
+					if (settings.useRealMAX) {
+						mediaItem = (await mediaItem.max?.()) ?? mediaItem;
+					}
 
-				// 파일 존재 여부 확인
-				const full = pathStr(path);
-				const check = await fileExists(full);
-				if (check.exists && check.size !== undefined && check.size >= MinValidFileSizeBytes) {
+					const { tags } = await mediaItem.flacTags();
+					const fileName = await getFileName(mediaItem, settings.downloadQuality, tags);
+					const path = [downloadFolder, fileName];
+					const full = pathStr(path);
+
+					// 파일 존재 여부 확인
+					const check = await fileExists(full);
+					if (check.exists && check.size !== undefined && check.size >= MinValidFileSizeBytes) {
+						return { type: "skipped" as const };
+					}
+					if (check.exists) await deleteFile(full);
+
+					// 중복 체크
+					if (this._items.some((i) => pathStr(i.path) === full && i.status !== "failed")) {
+						return { type: "skipped" as const };
+					}
+
+					const coverUrl = await mediaItem.coverUrl?.({ res: "80" }).catch(() => undefined);
+
+					return {
+						type: "ready" as const,
+						track: {
+							id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+							title: extractTag(tags.title),
+							artist: extractTag(tags.artist),
+							album: extractTag(tags.album),
+							coverUrl,
+							fileName,
+							path,
+							status: "queued" as TrackStatus,
+							progress: 0,
+							downloadedBytes: 0,
+							totalBytes: 0,
+							retryCount: 0,
+							_mediaItem: mediaItem,
+						},
+					};
+				}),
+			);
+
+			for (const result of results) {
+				if (result.status === "rejected") {
+					trace.msg.err.withContext("Failed to prepare track, skipping")(result.reason);
 					skipped++;
-					continue;
-				}
-				if (check.exists) await deleteFile(full);
-
-				// 중복 체크: 같은 경로의 트랙이 이미 큐에 있으면 건너뛴다
-				if (this._items.some((i) => pathStr(i.path) === full && i.status !== "failed")) {
+				} else if (result.value.type === "skipped") {
 					skipped++;
-					continue;
+				} else {
+					this._items.push(result.value.track);
+					added++;
 				}
-
-				const coverUrl = await mediaItem.coverUrl?.({ res: "80" }).catch(() => undefined);
-
-				this._items.push({
-					id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-					title: extractTag(tags.title),
-					artist: extractTag(tags.artist),
-					album: extractTag(tags.album),
-					coverUrl,
-					fileName,
-					path,
-					status: "queued",
-					progress: 0,
-					downloadedBytes: 0,
-					totalBytes: 0,
-					retryCount: 0,
-					_mediaItem: mediaItem,
-				});
-				added++;
-				this.notify();
-			} catch (err) {
-				// 개별 트랙 메타 수집 실패 — 이 트랙만 건너뛰고 루프는 계속
-				trace.msg.err.withContext("Failed to prepare track, skipping")(err);
-				skipped++;
 			}
+			this.notify();
 		}
 
 		if (added > 0) this.processNext();
@@ -173,35 +193,49 @@ export class DownloadQueue {
 		return added;
 	}
 
-	// --- 다운로드 루프 ---
+	// --- 동시 다운로드 루프 ---
+
+	private _activeDownloads = 0;
 
 	private async processNext(): Promise<void> {
-		if (this._processing || this._destroyed) return;
-		this._processing = true;
-		this.notify();
+		if (this._destroyed) return;
 
-		while (!this._destroyed) {
-			if (this._paused) {
-				await delay(500);
-				continue;
-			}
+		// 동시 다운로드 슬롯이 남아있는 만큼 병렬로 시작한다
+		const maxConcurrent = Math.max(1, Math.min(settings.concurrentDownloads ?? 3, 10));
+
+		while (!this._destroyed && !this._paused && this._activeDownloads < maxConcurrent) {
 			const next = this._items.find((i) => i.status === "queued");
 			if (!next) break;
 
-			// 개별 다운로드 실패를 격리: 한 곡이 터져도 루프는 다음 곡으로 계속 진행한다
-			try {
-				await this.downloadTrack(next);
-			} catch (err) {
-				trace.msg.err.withContext(`Unexpected error downloading "${next.title}", marking as failed`)(err);
-				this.update(next.id, {
-					status: "failed",
-					error: err instanceof Error ? err.message : "Unexpected error",
-				});
-			}
-		}
+			next.status = "downloading";
+			this._activeDownloads++;
+			this._processing = true;
+			this.notify();
 
-		this._processing = false;
-		this.notify();
+			// fire-and-forget으로 시작하되, 완료 시 다음 곡을 이어서 처리한다
+			this.runDownload(next).finally(() => {
+				this._activeDownloads--;
+				if (this._activeDownloads === 0 && !this._items.some((i) => i.status === "queued")) {
+					this._processing = false;
+				}
+				this.notify();
+				// 다음 대기열 곡을 채운다
+				this.processNext();
+			});
+		}
+	}
+
+	/** 개별 트랙 다운로드를 격리 실행한다. */
+	private async runDownload(track: DownloadTrack): Promise<void> {
+		try {
+			await this.downloadTrack(track);
+		} catch (err) {
+			trace.msg.err.withContext(`Unexpected error downloading "${track.title}", marking as failed`)(err);
+			this.update(track.id, {
+				status: "failed",
+				error: err instanceof Error ? err.message : "Unexpected error",
+			});
+		}
 	}
 
 	private async downloadTrack(track: DownloadTrack): Promise<void> {
@@ -292,6 +326,8 @@ export class DownloadQueue {
 	togglePause() {
 		this._paused = !this._paused;
 		this.notify();
+		// 일시정지 해제 시 대기열 처리를 재개한다
+		if (!this._paused) this.processNext();
 	}
 
 	destroy() {
